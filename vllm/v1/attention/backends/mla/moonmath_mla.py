@@ -33,12 +33,28 @@ _LAT, _ROPE = 512, 64
 _MAX_HEADS, _ROWS_PER_SLICE, _MAX_ROW_SLICES = 128, 96, 304
 
 
+def _kernel_serves(num_reqs: int, q_len: int, heads: int) -> bool:
+    return (
+        heads <= _MAX_HEADS
+        and num_reqs * cdiv(q_len * heads, _ROWS_PER_SLICE) <= _MAX_ROW_SLICES
+    )
+
+
 class MoonmathMLAMetadataBuilder(AiterMLAMetadataBuilder):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # The query is bf16 here (supports_quant_query_input=False), so pin
         # q_dtype rather than let the inherited env gate disagree with it.
         self._mla_q_dtype = self.decode_attn_out_dtype
+
+    def _decode_reads_aiter_schedule(
+        self, num_reqs: int, qo_len: int, uniform_qo_len: bool, causal: bool
+    ) -> bool:
+        return not (
+            causal
+            and uniform_qo_len
+            and _kernel_serves(num_reqs, qo_len, self._decode_num_heads)
+        )
 
 
 class MoonmathMLAImpl(AiterMLAImpl):
@@ -73,9 +89,8 @@ class MoonmathMLAImpl(AiterMLAImpl):
         if (
             not attn_metadata.causal
             or decode.paged_kv_indices is None
-            or heads > _MAX_HEADS
             or num_tokens != num_reqs * q_len
-            or num_reqs * cdiv(q_len * heads, _ROWS_PER_SLICE) > _MAX_ROW_SLICES
+            or not _kernel_serves(num_reqs, q_len, heads)
         ):
             return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
 
